@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Web DAW (Mobile PWA)</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="manifest" href="manifest.json" />
+</head>
+<body>
+  <header>
+    <h1>Web DAW</h1>
+    <div class="transport">
+      <button id="playBtn">Play</button>
+      <button id="stopBtn">Stop</button>
+      <button id="recordBtn">Record</button>
+      <input id="seek" type="range" min="0" max="60" step="0.01" value="0" />
+      <span id="timeDisplay">0.00</span>
+      <button id="exportBtn">Export WAV</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="tracksContainer"></section>
+
+    <div class="controls">
+      <input id="fileInput" type="file" accept="audio/*"/>
+      <button id="addTrackFromFile">Add Track from File</button>
+      <button id="addBlankTrack">Add Blank Track</button>
+    </div>
+  </main>
+
+  <template id="trackTemplate">
+    <div class="track">
+      <div class="track-header">
+        <input class="track-name" value="Track" />
+        <button class="muteBtn">M</button>
+        <button class="soloBtn">S</button>
+      </div>
+      <div class="track-controls">
+        <label>Vol <input type="range" class="vol" min="0" max="2" step="0.01" value="1"/></label>
+        <label>Pan <input type="range" class="pan" min="-1" max="1" step="0.01" value="0"/></label>
+        <label>LPF <input type="checkbox" class="lpf"/></label>
+        <button class="recClipBtn">Record Clip</button>
+        <button class="addClipBtn">+ Clip</button>
+      </div>
+      <div class="timeline"></div>
+    </div>
+  </template>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
+:root{
+  --bg:#0e0f14;
+  --card:#121217;
+  --accent:#03dac6;
+  --muted:#9aa0a6;
+  color-scheme: dark;
+}
+*{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+body{
+  margin:0; background:var(--bg); color:white; min-height:100vh; display:flex; flex-direction:column;
+}
+header{padding:12px; display:flex; align-items:center; justify-content:space-between; gap:12px}
+h1{margin:0;font-size:1.1rem}
+.transport{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+button{background:var(--card); border:1px solid #222; padding:8px 10px; color:white; border-radius:8px}
+input[type="range"]{height:28px}
+main{padding:12px; flex:1; display:flex; flex-direction:column; gap:12px}
+#tracksContainer{display:flex; flex-direction:column; gap:10px}
+.track{background:#101115; border-radius:10px; padding:8px; border:1px solid #1b1c22}
+.track-header{display:flex; gap:8px; align-items:center}
+.track-name{background:transparent; color:white; border:none; border-bottom:1px solid #1f2026; padding:4px}
+.track-controls{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px}
+.timeline{
+  margin-top:8px; background:#0b0b0d; height:64px; border-radius:6px; position:relative; overflow:hidden;
+  touch-action:none;
+}
+.clip{
+  position:absolute; top:8px; height:48px; background:linear-gradient(180deg,#2b2f36,#1b1d22);
+  border:1px solid #2f3338; border-radius:6px; display:flex; align-items:center; padding:6px; gap:6px;
+  user-select:none; -webkit-user-drag:none;
+}
+.controls{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+@media (max-width:600px){
+  header{flex-direction:column; align-items:flex-start; gap:8px}
+  .track-controls{gap:6px}
+}
+// app.js - minimal mobile-friendly web DAW using Web Audio API
+const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+let audioCtx = null;
+
+const state = {
+  tracks: [], // each: {id, name, clips: [{id, buffer, start}], nodes: {gain, pan, filter}, muted, solo}
+  playing: false,
+  transportStartAt: 0, // audioCtx.currentTime when playback started
+  transportPos: 0, // seconds from timeline origin when playback started
+  cursorInterval: null,
+  mediaRecorder: null,
+  recordingChunks: [],
+  sampleRate: 44100
+};
+
+const playBtn = document.getElementById('playBtn');
+const stopBtn = document.getElementById('stopBtn');
+const recordBtn = document.getElementById('recordBtn');
+const exportBtn = document.getElementById('exportBtn');
+const seek = document.getElementById('seek');
+const timeDisplay = document.getElementById('timeDisplay');
+
+function ensureAudioContext(){
+  if(!audioCtx){
+    audioCtx = new AudioContextClass({sampleRate: state.sampleRate});
+  }
+}
+
+// util: generate id
+const uid = (prefix='id')=> `${prefix}_${Math.random().toString(36).slice(2,9)}`;
+
+// --- Track/template management ---
+const tracksContainer = document.getElementById('tracksContainer');
+const trackTemplate = document.getElementById('trackTemplate').content;
+
+function createTrack(name = 'Track'){
+  ensureAudioContext();
+  const id = uid('track');
+  const root = document.importNode(trackTemplate, true);
+  const el = root.querySelector('.track');
+  el.dataset.trackId = id;
+  el.querySelector('.track-name').value = name;
+
+  // hook buttons
+  el.querySelector('.muteBtn').addEventListener('click', () => toggleMute(id));
+  el.querySelector('.soloBtn').addEventListener('click', () => toggleSolo(id));
+  el.querySelector('.vol').addEventListener('input', (e) => setVolume(id, Number(e.target.value)));
+  el.querySelector('.pan').addEventListener('input', (e) => setPan(id, Number(e.target.value)));
+  el.querySelector('.lpf').addEventListener('change', (e) => toggleLPF(id, e.target.checked));
+  el.querySelector('.addClipBtn').addEventListener('click', () => addClipFromFilePrompt(id));
+  el.querySelector('.recClipBtn').addEventListener('click', () => recordClipForTrack(id));
+  tracksContainer.appendChild(el);
+
+  // audio nodes
+  const gain = audioCtx.createGain();
+  gain.gain.value = 1;
+  const pan = audioCtx.createStereoPanner();
+  pan.pan.value = 0;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 22000; // off by default
+
+  // connect chain to destination (we'll connect main gain per track to master)
+  gain.connect(pan);
+  pan.connect(filter);
+  filter.connect(audioCtx.destination);
+
+  // store
+  const track = {
+    id, name, el, clips: [], nodes: {gain, pan, filter}, muted:false, solo:false
+  };
+  state.tracks.push(track);
+  return track;
+}
+
+// --- Clips (visual + audio buffer) ---
+function addClip(trackId, audioBuffer, start=0){
+  const track = state.tracks.find(t=>t.id===trackId);
+  if(!track) return;
+  const clipId = uid('clip');
+  const timeline = track.el.querySelector('.timeline');
+
+  // create visual element
+  const clipEl = document.createElement('div');
+  clipEl.className = 'clip';
+  clipEl.dataset.clipId = clipId;
+  clipEl.style.left = `${start * 100}px`; // 100 px = 1 second base zoom (simple)
+  const widthSec = Math.max(0.5, audioBuffer.duration);
+  clipEl.style.width = `${widthSec * 100}px`;
+  clipEl.innerText = `${(audioBuffer.duration).toFixed(2)}s`;
+  timeline.appendChild(clipEl);
+
+  // draggable horizontally (basic)
+  let startX = 0, startLeft = 0;
+  clipEl.addEventListener('pointerdown', (ev)=>{
+    ev.preventDefault();
+    clipEl.setPointerCapture(ev.pointerId);
+    startX = ev.clientX;
+    startLeft = parseFloat(clipEl.style.left || 0);
+    function move(e){
+      const dx = e.clientX - startX;
+      clipEl.style.left = `${Math.max(0, startLeft + dx)}px`;
+    }
+    function up(e){
+      clipEl.releasePointerCapture(ev.pointerId);
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      // update clip start based on left
+      const leftPx = parseFloat(clipEl.style.left || 0);
+      const newStart = leftPx / 100;
+      const clip = track.clips.find(c=>c.id===clipId);
+      if(clip) clip.start = newStart;
+    }
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+  });
+
+  const clip = {id: clipId, buffer: audioBuffer, start};
+  track.clips.push(clip);
+  return clip;
+}
+
+// --- Recording (global) ---
+async function recordClipForTrack(trackId){
+  ensureAudioContext();
+  // start MediaRecorder; user must interact with page before audio can be recorded on mobile.
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    alert('getUserMedia not supported');
+    return;
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+  const mr = new MediaRecorder(stream);
+  state.recordingChunks = [];
+  mr.ondataavailable = e => state.recordingChunks.push(e.data);
+  mr.onstop = async ()=>{
+    const blob = new Blob(state.recordingChunks, {type:'audio/webm'});
+    const array = await blob.arrayBuffer();
+    const decoded = await audioCtx.decodeAudioData(array);
+    // add clip at transport position
+    addClip(trackId, decoded, state.transportPos || 0);
+    stream.getTracks().forEach(t=>t.stop());
+  };
+  mr.start();
+  // basic UI: record for 5 seconds or until second tap (toggle)
+  const stopAfter = 5000;
+  recordBtn.textContent = 'Stop Rec';
+  recordBtn.disabled = true;
+  setTimeout(()=>{
+    mr.stop();
+    recordBtn.textContent = 'Record';
+    recordBtn.disabled = false;
+  }, stopAfter);
+}
+
+// add clip from file prompt
+function addClipFromFilePrompt(trackId){
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'audio/*';
+  input.onchange = async ()=>{
+    const file = input.files[0];
+    if(!file) return;
+    const arr = await file.arrayBuffer();
+    ensureAudioContext();
+    const buf = await audioCtx.decodeAudioData(arr);
+    addClip(trackId, buf, 0);
+  };
+  input.click();
+}
+
+// add track from external file (global UI)
+document.getElementById('addTrackFromFile').addEventListener('click', async ()=>{
+  const input = document.getElementById('fileInput');
+  input.onchange = async ()=>{
+    const f = input.files[0];
+    if(!f) return;
+    const arr = await f.arrayBuffer();
+    ensureAudioContext();
+    const buf = await audioCtx.decodeAudioData(arr);
+    const tr = createTrack(f.name || 'File Track');
+    addClip(tr.id, buf, 0);
+    input.value = '';
+  };
+  input.click();
+});
+
+// add blank track
+document.getElementById('addBlankTrack').addEventListener('click', ()=>{
+  createTrack('Track ' + (state.tracks.length+1));
+});
+
+// per-track node setters
+function setVolume(trackId, val){
+  const t = state.tracks.find(x=>x.id===trackId);
+  if(t) t.nodes.gain.gain.value = val;
+}
+function setPan(trackId, val){
+  const t = state.tracks.find(x=>x.id===trackId);
+  if(t) t.nodes.pan.pan.value = val;
+}
+function toggleLPF(trackId, on){
+  const t = state.tracks.find(x=>x.id===trackId);
+  if(t) t.nodes.filter.frequency.value = on ? 1200 : 22000;
+}
+function toggleMute(trackId){
+  const t = state.tracks.find(x=>x.id===trackId);
+  if(!t) return;
+  t.muted = !t.muted;
+  t.el.querySelector('.muteBtn').style.opacity = t.muted ? 0.5 : 1;
+}
+function toggleSolo(trackId){
+  const t = state.tracks.find(x=>x.id===trackId);
+  if(!t) return;
+  t.solo = !t.solo;
+  t.el.querySelector('.soloBtn').style.opacity = t.solo ? 0.5 : 1;
+}
+
+// --- Transport ---
+function startTransport(){
+  if(state.playing) return;
+  ensureAudioContext();
+  // resume context if suspended (mobile)
+  if(audioCtx.state === 'suspended') audioCtx.resume();
+  // schedule all clips
+  const now = audioCtx.currentTime;
+  state.transportStartAt = now;
+  const playPos = Number(seek.value) || 0;
+  state.transportPos = playPos;
+  state.playing = true;
+
+  // stop any currently playing sources (naive: we'll keep a list on each clip as active node)
+  stopAllSources();
+
+  // Create buffer sources for each clip and call start(when)
+  for(const track of state.tracks){
+    const disabledBySolo = state.tracks.some(t=>t.solo) && !track.solo;
+    const enabled = !track.muted && !disabledBySolo;
+    for(const clip of track.clips){
+      const when = now + Math.max(0, clip.start - playPos); // start relative to transport
+      if(when < now + 10*60 && enabled){ // sanity
+        const src = audioCtx.createBufferSource();
+        src.buffer = clip.buffer;
+        // connect to track chain (create per-play nodes to avoid reuse issues)
+        const gain = audioCtx.createGain();
+        gain.gain.value = track.nodes.gain.gain.value;
+        const pan = audioCtx.createStereoPanner();
+        pan.pan.value = track.nodes.pan.pan.value;
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = track.nodes.filter.frequency.value;
+        src.connect(gain);
+        gain.connect(pan);
+        pan.connect(filter);
+        filter.connect(audioCtx.destination);
+        src.start(when);
+        // keep reference for stopping if needed
+        clip._active = clip._active || [];
+        clip._active.push({node:src, stopAt: when + clip.buffer.duration});
+      }
+    }
+  }
+
+  // cursor update
+  state.cursorInterval = setInterval(() => {
+    const elapsed = audioCtx.currentTime - state.transportStartAt;
+    const pos = (state.transportPos + elapsed);
+    seek.value = pos.toFixed(2);
+    timeDisplay.textContent = pos.toFixed(2);
+  }, 100);
+}
+
+function stopAllSources(){
+  for(const track of state.tracks){
+    for(const clip of track.clips){
+      if(clip._active){
+        for(const obj of clip._active){
+          try{ obj.node.stop(); } catch(e) {}
+        }
+        clip._active = [];
+      }
+    }
+  }
+}
+
+function stopTransport(){
+  if(!state.playing) return;
+  stopAllSources();
+  state.playing = false;
+  clearInterval(state.cursorInterval);
+}
+
+playBtn.addEventListener('click', () => {
+  if(!state.playing) startTransport();
+  else stopTransport();
+  playBtn.textContent = state.playing ? 'Pause' : 'Play';
+});
+stopBtn.addEventListener('click', () => {
+  stopTransport();
+  seek.value = 0;
+  timeDisplay.textContent = '0.00';
+});
+
+// seek control
+seek.addEventListener('input', () => {
+  timeDisplay.textContent = Number(seek.value).toFixed(2);
+  if(state.playing){
+    // restart play at new position (simple)
+    stopTransport();
+    startTransport();
+  } else {
+    state.transportPos = Number(seek.value);
+  }
+});
+
+// export mix to WAV using OfflineAudioContext
+exportBtn.addEventListener('click', async ()=>{
+  if(state.tracks.length === 0){
+    alert('No tracks to export');
+    return;
+  }
+  ensureAudioContext();
+  // compute final duration (find last clip end)
+  let duration = 0;
+  for(const t of state.tracks){
+    for(const c of t.clips){
+      duration = Math.max(duration, c.start + c.buffer.duration);
+    }
+  }
+  if(duration <= 0) duration = 1;
+
+  const offline = new OfflineAudioContext(2, Math.ceil(duration * state.sampleRate), state.sampleRate);
+
+  // for each track, create buffer source at correct start and connect to nodes with same settings
+  for(const t of state.tracks){
+    const disabledBySolo = state.tracks.some(tt=>tt.solo) && !t.solo;
+    const enabled = !t.muted && !disabledBySolo;
+    if(!enabled) continue;
+    for(const c of t.clips){
+      const src = offline.createBufferSource();
+      src.buffer = c.buffer;
+      const g = offline.createGain(); g.gain.value = t.nodes.gain.gain.value;
+      const p = offline.createStereoPanner(); p.pan.value = t.nodes.pan.pan.value;
+      const f = offline.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = t.nodes.filter.frequency.value;
+      src.connect(g); g.connect(p); p.connect(f); f.connect(offline.destination);
+      src.start(c.start);
+    }
+  }
+
+  const rendered = await offline.startRendering();
+  // convert to WAV (16-bit PCM)
+  const wav = audioBufferToWav(rendered);
+  const blob = new Blob([new DataView(wav)], {type: 'audio/wav'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'mixdown.wav';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// small helper: audioBuffer -> wav arrayBuffer (16-bit PCM)
+function audioBufferToWav(buffer, opt = {}) {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const format = opt.float32 ? 3 : 1;
+  const bitDepth = format === 3 ? 32 : 16;
+  let result;
+  if (numChannels === 2) {
+    result = interleave(buffer.getChannelData(0), buffer.getChannelData(1));
+  } else {
+    result = buffer.getChannelData(0);
+  }
+
+  if (format === 1) {
+    result = floatTo16BitPCM(result);
+  } else {
+    result = floatTo32Bit(result);
+  }
+
+  const bufferLength = result.byteLength;
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  /* RIFF identifier */
+  writeString(view, 0, 'RIFF');
+  /* file length */
+  view.setUint32(4, 36 + bufferLength, true);
+  /* RIFF type */
+  writeString(view, 8, 'WAVE');
+  /* format chunk identifier */
+  writeString(view, 12, 'fmt ');
+  /* format chunk length */
+  view.setUint32(16, 16, true);
+  /* sample format (raw) */
+  view.setUint16(20, format === 1 ? 1 : 3, true);
+  /* channel count */
+  view.setUint16(22, numChannels, true);
+  /* sample rate */
+  view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
+  view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+  /* block align (channel count * bytes per sample) */
+  view.setUint16(32, numChannels * (bitDepth / 8), true);
+  /* bits per sample */
+  view.setUint16(34, bitDepth, true);
+  /* data chunk identifier */
+  writeString(view, 36, 'data');
+  /* data chunk length */
+  view.setUint32(40, bufferLength, true);
+
+  // combine header and data
+  const wavBuffer = new Uint8Array(44 + bufferLength);
+  wavBuffer.set(new Uint8Array(header), 0);
+  wavBuffer.set(new Uint8Array(result), 44);
+  return wavBuffer.buffer;
+
+  function interleave(inputL, inputR) {
+    const length = inputL.length + inputR.length;
+    const result = new Float32Array(length);
+    let index = 0, inputIndex = 0;
+    while (index < length) {
+      result[index++] = inputL[inputIndex];
+      result[index++] = inputR[inputIndex];
+      inputIndex++;
+    }
+    return result;
+  }
+  function floatTo16BitPCM(float32Array) {
+    const buffer = new ArrayBuffer(float32Array.length * 2);
+    const view = new DataView(buffer);
+    let offset = 0;
+    for (let i = 0; i < float32Array.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, float32Array[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return buffer;
+  }
+  function floatTo32Bit(float32Array) {
+    return new Float32Array(float32Array).buffer;
+  }
+  function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+}
+
+// initialize with one track
+createTrack('Track 1');
+
+// quick demo: drag-and-drop file to page to add track
+window.addEventListener('drop', async (e)=>{
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if(!f) return;
+  const arr = await f.arrayBuffer();
+  ensureAudioContext();
+  const buf = await audioCtx.decodeAudioData(arr);
+  const tr = createTrack(f.name || 'Dropped Track');
+  addClip(tr.id, buf, 0);
+});
+window.addEventListener('dragover', (e)=> e.preventDefault());
+{
+  "name": "Web DAW",
+  "short_name": "WebDAW",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#0e0f14",
+  "theme_color": "#03dac6",
+  "icons": []
+}
+// sw.js - super simple service worker caching shell
+const CACHE = 'webdaw-v1';
+const FILES = [
+  '.',
+  '/index.html',
+  '/styles.css',
+  '/app.js',
+  '/manifest.json'
+];
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)));
+});
+self.addEventListener('fetch', (e) => {
+  e.respondWith(caches.match(e.request).then(resp => resp || fetch(e.request)));
+});
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').catch(console.error);
+}
